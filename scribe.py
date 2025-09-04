@@ -10,23 +10,32 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response
 
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+import redis
+from rq import Queue
+
+from openai import OpenAI
 
 
 # --- Configuration ---
-WORKSPACE_DIR = "/workspace"
-ROLES_FILE = os.path.join(WORKSPACE_DIR, "roles.yaml")
-USERS_MAP_FILE = os.path.join(WORKSPACE_DIR, "users", "map.yaml")
-JOBS_DIR = os.path.join(WORKSPACE_DIR, "jobs")
+workspace_dir = os.getcwd()
+jobs_dir = os.path.join(workspace_dir, "jobs")
 
-OPENAI_RESPONSES_MODEL = os.getenv("OPENAI_RESPONSES_MODEL", "gpt-4o-mini")
-OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
-DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "aged_care_worker")
+redis_url = os.getenv("REDIS_URL", "")
+rq_queue_name = "scribe"
+rq_default_timeout = 600
+
+openai_responses_model = "gpt-5"
+openai_transcription_model = "whisper-1"
+default_role = "aged_care_worker"
+max_total_sentences = 10
+
+twilio_api_base_url = "https://api.twilio.com"
+twilio_api_version = "2010-04-01"
+
+# MMS character hard limit (Twilio MMS body limit)
+mms_character_limit = 1600
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -39,20 +48,35 @@ app = FastAPI(title="Scribe API")
 
 # --- Utilities ---
 def ensure_dirs() -> None:
-    os.makedirs(JOBS_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(USERS_MAP_FILE), exist_ok=True)
+    os.makedirs(jobs_dir, exist_ok=True)
+    os.makedirs(os.path.join(workspace_dir, "users"), exist_ok=True)
 
 
-def load_roles() -> Dict[str, Dict[str, int]]:
-    if not os.path.exists(ROLES_FILE):
-        return {}
-    with open(ROLES_FILE, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    # Ensure all values are int
-    roles: Dict[str, Dict[str, int]] = {}
-    for role, sections in data.items():
-        roles[role] = {str(k): int(v) for k, v in (sections or {}).items()}
-    return roles
+def resolve_workspace_path(relative_path: str) -> str:
+    primary_path = os.path.join(workspace_dir, relative_path)
+    secondary_path = os.path.join(os.getcwd(), relative_path)
+    return primary_path if os.path.exists(primary_path) else secondary_path
+
+
+def load_system_prompt() -> str:
+    path = resolve_workspace_path("scribe.md")
+    if not os.path.exists(path):
+        raise FileNotFoundError("System prompt for scribe not found in workspace.")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def get_redis_queue() -> Optional[Queue]:
+    if not redis_url:
+        return None
+    try:
+        connection = redis.from_url(redis_url)
+        return Queue(name=rq_queue_name, connection=connection, default_timeout=rq_default_timeout)
+    except Exception:
+        return None
+
+
+ 
 
 
 def compute_phone_hmac(phone_number: str) -> str:
@@ -65,56 +89,36 @@ def compute_phone_hmac(phone_number: str) -> str:
 
 def get_role_for_phone(phone_number: str) -> str:
     """Securely resolve a role for a phone number using HMAC mapping stored in /users/map.yaml.
-    Falls back to DEFAULT_ROLE if no mapping exists.
+    Falls back to default_role if no mapping exists.
     """
     try:
         phone_key = compute_phone_hmac(phone_number)
     except Exception:
         # If secret missing, default to configured default role.
-        return DEFAULT_ROLE
+        return default_role
 
-    if not os.path.exists(USERS_MAP_FILE):
-        return DEFAULT_ROLE
+    map_path = resolve_workspace_path(os.path.join("users", "map.yaml"))
+    if not os.path.exists(map_path):
+        return default_role
 
     try:
-        with open(USERS_MAP_FILE, "r", encoding="utf-8") as f:
+        with open(map_path, "r", encoding="utf-8") as f:
             mapping = yaml.safe_load(f) or {}
         role = mapping.get(phone_key)
-        return role or DEFAULT_ROLE
+        return role or default_role
     except Exception:
-        return DEFAULT_ROLE
+        return default_role
 
 
-def build_json_schema_for_sections(sections: Dict[str, int]) -> Dict[str, Any]:
-    properties: Dict[str, Any] = {}
-    required: List[str] = []
-    for name, max_sentences in sections.items():
-        properties[name] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 0,
-            "maxItems": int(max_sentences),
-        }
-        required.append(name)
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": properties,
-        "required": required,
-    }
+ 
 
 
-def format_plaintext_notes(sections: Dict[str, int], notes: Dict[str, List[str]]) -> str:
-    lines: List[str] = []
-    for section_name, max_sentences in sections.items():
-        sentences = notes.get(section_name, []) or []
-        sentences = [s.strip() for s in sentences if s and str(s).strip()]
-        sentences = sentences[: int(max_sentences)]
-        title = section_name.replace("_", " ").title()
-        content = " ".join(sentences)
-        lines.append(f"{title}: {content}".strip())
-    # Simple newline separation between sections (no extra blank lines)
-    return "\n".join(lines)
+def enforce_mms_limit(text: str, limit: int = mms_character_limit) -> str:
+    if limit <= 0:
+        return ""
+    if not text:
+        return ""
+    return text[: limit]
 
 
 def save_job(
@@ -123,7 +127,6 @@ def save_job(
     role: str,
     sections: Dict[str, int],
     transcript: str,
-    notes_structured: Dict[str, List[str]],
     notes_plaintext: str,
 ) -> str:
     ensure_dirs()
@@ -135,10 +138,9 @@ def save_job(
         "role": role,
         "sections": sections,
         "transcript": transcript,
-        "notes": notes_structured,
         "notes_plaintext": notes_plaintext,
     }
-    path = os.path.join(JOBS_DIR, f"{job_id}.json")
+    path = os.path.join(jobs_dir, f"{job_id}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return path
@@ -147,7 +149,7 @@ def save_job(
 def send_text_message(to_number: str, body: str) -> None:
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
         return
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    url = f"{twilio_api_base_url}/{twilio_api_version}/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
     data = {
         "To": to_number,
         "From": TWILIO_FROM_NUMBER,
@@ -158,9 +160,15 @@ def send_text_message(to_number: str, body: str) -> None:
 
 
 def download_twilio_recording(recording_url: str) -> bytes:
-    # Twilio RecordingUrl may require an explicit extension for mp3
+    """Fetch the Twilio recording as MP3.
+
+    Twilio stores recordings as WAV (default, 128 kbps) and returns MP3 (32 kbps)
+    when ".mp3" is appended to the RecordingUrl.
+    """
     url = recording_url
-    if not url.endswith((".mp3", ".wav")):
+    if url.endswith(".wav"):
+        url = url[:-4] + ".mp3"
+    elif not url.endswith(".mp3"):
         url = url + ".mp3"
     with httpx.Client(timeout=60.0) as client:
         resp = client.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
@@ -177,12 +185,9 @@ def transcribe_audio_bytes(file_bytes: bytes) -> str:
         tmp.flush()
         tmp_path = tmp.name
     with open(tmp_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model=OPENAI_TRANSCRIPTION_MODEL,
+        result = client.audio.translations.create(
+            model=openai_transcription_model,
             file=f,
-            temperature=0,
-            response_format="json",
-            translate=True,
         )
     # Fallbacks for various SDK return shapes
     text: str = ""
@@ -193,76 +198,39 @@ def transcribe_audio_bytes(file_bytes: bytes) -> str:
     return text.strip()
 
 
-def generate_structured_notes(transcript: str, role: str, sections: Dict[str, int]) -> Dict[str, List[str]]:
+def generate_plaintext_notes(transcript: str, role: str) -> str:
     if OpenAI is None:
-        return {name: [] for name in sections.keys()}
+        return ""
     client = OpenAI()
 
-    system_prompt = (
-        "You are a scribe agent helping a human in a job to write work notes "
-        "based on a recount of their day. Write work notes according to the provided "
-        "structure with each section within the maximum number of sentences. Use "
-        "concise professional language, past tense, and avoid PII."
-    )
-
-    # Soft prompt: present the schema and limits
-    schema_lines: List[str] = []
-    for name, max_sents in sections.items():
-        schema_lines.append(f"- {name}: {max_sents}")
-    soft_prompt = (
-        f"Role: {role}\n"
-        f"Work Note Schema (section: max_sentences):\n" + "\n".join(schema_lines) + "\n\n"
+    system_text = load_system_prompt()
+    role_words = role.replace("_", " ").strip()
+    user_text = (
+        f"Role keywords: {role_words}\n\n"
         f"Transcript:\n{transcript.strip()}\n"
     )
 
-    json_schema = build_json_schema_for_sections(sections)
-
     response = client.responses.create(
-        model=OPENAI_RESPONSES_MODEL,
+        model=openai_responses_model,
         input=[
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": soft_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": system_text}]},
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
         ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "work_notes",
-                "schema": json_schema,
-                "strict": True,
-            },
-        },
     )
 
-    raw_text: str = ""
-    # Try common accessors for Responses API aggregated text
-    raw_text = getattr(response, "output_text", "") or raw_text
-    if not raw_text:
-        # Attempt to build text from output content blocks
+    text: str = ""
+    text = getattr(response, "output_text", "") or text
+    if not text:
         try:
             outputs = getattr(response, "output", [])
             if outputs:
                 first = outputs[0]
                 content = first.get("content") if isinstance(first, dict) else None
                 if isinstance(content, list) and content and isinstance(content[0], dict):
-                    raw_text = content[0].get("text", "")
+                    text = content[0].get("text", "")
         except Exception:
-            raw_text = ""
-
-    notes: Dict[str, List[str]] = {name: [] for name in sections.keys()}
-    if raw_text:
-        try:
-            parsed = json.loads(raw_text)
-            if isinstance(parsed, dict):
-                for k, v in parsed.items():
-                    if k in sections and isinstance(v, list):
-                        notes[k] = [str(s).strip() for s in v if str(s).strip()]
-        except Exception:
-            pass
-
-    # Enforce max sentences per section
-    for name, max_sents in sections.items():
-        notes[name] = (notes.get(name) or [])[: int(max_sents)]
-    return notes
+            text = ""
+    return text.strip()
 
 
 def process_recording(from_number: str, recording_url: str, call_sid: str) -> None:
@@ -271,22 +239,19 @@ def process_recording(from_number: str, recording_url: str, call_sid: str) -> No
         transcript = transcribe_audio_bytes(audio_bytes) or ""
         role = get_role_for_phone(from_number)
 
-        roles = load_roles()
-        sections = roles.get(role) or {}
-        if not sections:
-            sections = load_roles().get(DEFAULT_ROLE, {})
-
-        notes_structured = generate_structured_notes(transcript=transcript, role=role, sections=sections)
-        notes_plaintext = format_plaintext_notes(sections, notes_structured)
+        notes_plaintext = generate_plaintext_notes(
+            transcript=transcript,
+            role=role,
+        )
+        notes_plaintext = enforce_mms_limit(notes_plaintext, mms_character_limit)
 
         job_id = str(uuid.uuid4())
         save_job(
             job_id=job_id,
             phone_number=from_number,
             role=role,
-            sections=sections,
+            sections={},
             transcript=transcript,
-            notes_structured=notes_structured,
             notes_plaintext=notes_plaintext,
         )
 
@@ -324,7 +289,14 @@ async def voice_complete(request: Request, background_tasks: BackgroundTasks) ->
     call_sid = str(form.get("CallSid", "")).strip()
 
     if from_number and recording_url:
-        background_tasks.add_task(process_recording, from_number, recording_url, call_sid)
+        queue = get_redis_queue()
+        if queue:
+            try:
+                queue.enqueue(process_recording, from_number, recording_url, call_sid)
+            except Exception:
+                background_tasks.add_task(process_recording, from_number, recording_url, call_sid)
+        else:
+            background_tasks.add_task(process_recording, from_number, recording_url, call_sid)
 
     # Respond quickly to Twilio to end the call politely
     twiml = (
