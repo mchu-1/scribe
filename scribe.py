@@ -18,6 +18,11 @@ from rq import Queue
 from openai import OpenAI
 
 
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file if present
+load_dotenv()
+
 # --- Configuration ---
 workspace_dir = os.getcwd()
 jobs_dir = os.path.join(workspace_dir, "jobs")
@@ -58,6 +63,33 @@ def resolve_workspace_path(relative_path: str) -> str:
     return primary_path if os.path.exists(primary_path) else secondary_path
 
 
+def resolve_user_yaml_path() -> str:
+    """Resolve the path to the `user.yaml` mapping file.
+
+    Allowed sources:
+    1) USER_YAML_PATH env var
+    2) Render Secret File default: /etc/secrets/user.yaml
+    """
+    env_yaml_path = os.getenv("USER_YAML_PATH", "").strip()
+    if env_yaml_path and os.path.exists(env_yaml_path):
+        return env_yaml_path
+
+    render_secret_yaml = "/etc/secrets/user.yaml"
+    if os.path.exists(render_secret_yaml):
+        return render_secret_yaml
+
+    return ""
+
+
+def load_user_mapping_yaml(path: str) -> Dict[str, str]:
+    """Load user mapping from YAML; return empty dict on error."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 def load_system_prompt() -> str:
     path = resolve_workspace_path("scribe.md")
     if not os.path.exists(path):
@@ -88,7 +120,7 @@ def compute_phone_hmac(phone_number: str) -> str:
 
 
 def get_role_for_phone(phone_number: str) -> str:
-    """Securely resolve a role for a phone number using HMAC mapping stored in /users/map.yaml.
+    """Securely resolve a role for a phone number using HMAC mapping stored in user.yaml.
     Falls back to default_role if no mapping exists.
     """
     try:
@@ -97,13 +129,12 @@ def get_role_for_phone(phone_number: str) -> str:
         # If secret missing, default to configured default role.
         return default_role
 
-    map_path = resolve_workspace_path(os.path.join("users", "map.yaml"))
-    if not os.path.exists(map_path):
+    map_path = resolve_user_yaml_path()
+    if not map_path or not os.path.exists(map_path):
         return default_role
 
+    mapping = load_user_mapping_yaml(map_path)
     try:
-        with open(map_path, "r", encoding="utf-8") as f:
-            mapping = yaml.safe_load(f) or {}
         role = mapping.get(phone_key)
         return role or default_role
     except Exception:
