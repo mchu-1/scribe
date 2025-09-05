@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+httpx
+PyYAML
+openai>=1.0.0
+redis>=5
+rq>=1.15
+python-multipart
+
+python-dotenv>=1.0.0
