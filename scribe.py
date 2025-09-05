@@ -262,8 +262,13 @@ def generate_plaintext_notes(transcript: str, role: str) -> str:
 
 def process_recording(from_number: str, recording_url: str, call_sid: str) -> None:
     try:
+        job_id = str(uuid.uuid4())
         audio_bytes = download_twilio_recording(recording_url)
         transcript = transcribe_audio_bytes(audio_bytes) or ""
+        print(
+            f"[scribe] job_id={job_id} call_sid={call_sid} from={from_number} transcript:\n{transcript}",
+            flush=True,
+        )
         role = get_role_for_phone(from_number)
 
         notes_plaintext = generate_plaintext_notes(
@@ -271,8 +276,11 @@ def process_recording(from_number: str, recording_url: str, call_sid: str) -> No
             role=role,
         )
         notes_plaintext = enforce_mms_limit(notes_plaintext, mms_character_limit)
+        print(
+            f"[scribe] job_id={job_id} notes (len={len(notes_plaintext)}):\n{notes_plaintext}",
+            flush=True,
+        )
 
-        job_id = str(uuid.uuid4())
         save_job(
             job_id=job_id,
             phone_number=from_number,
