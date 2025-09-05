@@ -33,7 +33,6 @@ rq_default_timeout = 600
 
 openai_responses_model = "gpt-5"
 openai_transcription_model = "whisper-1"
-default_role = "aged_care_worker"
 max_total_sentences = 10
 
 twilio_api_base_url = "https://api.twilio.com"
@@ -120,25 +119,22 @@ def compute_phone_hmac(phone_number: str) -> str:
 
 
 def get_role_for_phone(phone_number: str) -> str:
-    """Securely resolve a role for a phone number using HMAC mapping stored in user.yaml.
-    Falls back to default_role if no mapping exists.
+    """Resolve role via HMAC mapping in users.yaml.
+    Raises if the secret, mapping file, or mapping entry is missing.
     """
-    try:
-        phone_key = compute_phone_hmac(phone_number)
-    except Exception:
-        # If secret missing, default to configured default role.
-        return default_role
+    phone_key = compute_phone_hmac(phone_number)
 
     map_path = resolve_user_yaml_path()
     if not map_path or not os.path.exists(map_path):
-        return default_role
+        raise RuntimeError(
+            "USER_YAML_PATH is not set or mapping file not found; cannot resolve role."
+        )
 
     mapping = load_user_mapping_yaml(map_path)
-    try:
-        role = mapping.get(phone_key)
-        return role or default_role
-    except Exception:
-        return default_role
+    role: Optional[str] = mapping.get(phone_key)
+    if not role or not isinstance(role, str) or not role.strip():
+        raise RuntimeError("No role mapping found for the provided phone number.")
+    return role.strip()
 
 
  
