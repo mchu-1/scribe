@@ -6,6 +6,7 @@ import yaml
 import httpx
 import hashlib
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
@@ -228,36 +229,50 @@ def transcribe_audio_bytes(file_bytes: bytes) -> str:
 def generate_plaintext_notes(transcript: str, role: str) -> str:
     if OpenAI is None:
         return ""
-    client = OpenAI()
+    try:
+        print(
+            f"[scribe] notes:starting responses.create model={openai_responses_model} "
+            f"api_key_set={bool(os.getenv('OPENAI_API_KEY'))} role={role} "
+            f"transcript_len={len(transcript)}",
+            flush=True,
+        )
 
-    system_text = load_system_prompt()
-    role_words = role.replace("_", " ").strip()
-    user_text = (
-        f"Role keywords: {role_words}\n\n"
-        f"Transcript:\n{transcript.strip()}\n"
-    )
+        client = OpenAI()
 
-    response = client.responses.create(
-        model=openai_responses_model,
-        input=[
-            {"role": "system", "content": [{"type": "text", "text": system_text}]},
-            {"role": "user", "content": [{"type": "text", "text": user_text}]},
-        ],
-    )
+        system_text = load_system_prompt()
+        role_words = role.replace("_", " ").strip()
+        user_text = (
+            f"Role keywords: {role_words}\n\n"
+            f"Transcript:\n{transcript.strip()}\n"
+        )
 
-    text: str = ""
-    text = getattr(response, "output_text", "") or text
-    if not text:
-        try:
-            outputs = getattr(response, "output", [])
-            if outputs:
-                first = outputs[0]
-                content = first.get("content") if isinstance(first, dict) else None
-                if isinstance(content, list) and content and isinstance(content[0], dict):
-                    text = content[0].get("text", "")
-        except Exception:
-            text = ""
-    return text.strip()
+        response = client.responses.create(
+            model=openai_responses_model,
+            input=[
+                {"role": "system", "content": [{"type": "text", "text": system_text}]},
+                {"role": "user", "content": [{"type": "text", "text": user_text}]},
+            ],
+        )
+        print("[scribe] notes:responses.create OK", flush=True)
+
+        text: str = ""
+        text = getattr(response, "output_text", "") or text
+        if not text:
+            try:
+                outputs = getattr(response, "output", [])
+                if outputs:
+                    first = outputs[0]
+                    content = first.get("content") if isinstance(first, dict) else None
+                    if isinstance(content, list) and content and isinstance(content[0], dict):
+                        text = content[0].get("text", "")
+            except Exception:
+                text = ""
+        print(f"[scribe] notes:text_len={len(text.strip())}", flush=True)
+        return text.strip()
+    except Exception as e:
+        print(f"[scribe] notes:error {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return ""
 
 
 def process_recording(from_number: str, recording_url: str, call_sid: str) -> None:
@@ -292,9 +307,9 @@ def process_recording(from_number: str, recording_url: str, call_sid: str) -> No
 
         if notes_plaintext.strip():
             send_text_message(to_number=from_number, body=notes_plaintext)
-    except Exception:
-        # Swallow errors to avoid retry loops; Twilio will already have a call flow response
-        pass
+    except Exception as e:
+        print(f"[scribe] job_id={job_id} error in process_recording: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
 
 
 # --- Routes ---
