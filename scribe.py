@@ -64,21 +64,23 @@ def resolve_workspace_path(relative_path: str) -> str:
 
 
 def resolve_user_yaml_path() -> str:
-    """Resolve the path to the `user.yaml` mapping file.
+    """Resolve the path to the `users.yaml` mapping file.
 
-    Allowed sources:
-    1) USER_YAML_PATH env var
-    2) Render Secret File default: /etc/secrets/user.yaml
+    Resolution rules (no silent fallbacks):
+    1) If USER_YAML_PATH is set: use it if it exists, otherwise raise.
+    2) Otherwise, use `/etc/secrets/users.yaml` if it exists, otherwise raise.
     """
     env_yaml_path = os.getenv("USER_YAML_PATH", "").strip()
-    if env_yaml_path and os.path.exists(env_yaml_path):
-        return env_yaml_path
+    if env_yaml_path:
+        if os.path.exists(env_yaml_path):
+            return env_yaml_path
+        raise RuntimeError(f"USER_YAML_PATH is set but file not found: {env_yaml_path}")
 
-    render_secret_yaml = "/etc/secrets/user.yaml"
+    render_secret_yaml = "/etc/secrets/users.yaml"
     if os.path.exists(render_secret_yaml):
         return render_secret_yaml
 
-    return ""
+    raise RuntimeError("Render secret file not found at /etc/secrets/users.yaml")
 
 
 def load_user_mapping_yaml(path: str) -> Dict[str, str]:
