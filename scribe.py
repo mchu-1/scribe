@@ -250,25 +250,15 @@ def generate_plaintext_notes(transcript: str, role: str) -> str:
 
         response = client.responses.create(
             model=openai_responses_model,
+            reasoning={"effort": "low"},
             input=[
-                {"role": "system", "content": [{"type": "text", "text": system_text}]},
-                {"role": "user", "content": [{"type": "text", "text": user_text}]},
+                {"role": "developer", "content": system_text},
+                {"role": "user", "content": user_text},
             ],
         )
         print("[scribe] notes:responses.create OK", flush=True)
 
-        text: str = ""
-        text = getattr(response, "output_text", "") or text
-        if not text:
-            try:
-                outputs = getattr(response, "output", [])
-                if outputs:
-                    first = outputs[0]
-                    content = first.get("content") if isinstance(first, dict) else None
-                    if isinstance(content, list) and content and isinstance(content[0], dict):
-                        text = content[0].get("text", "")
-            except Exception:
-                text = ""
+        text: str = getattr(response, "output_text", "") or ""
         print(f"[scribe] notes:text_len={len(text.strip())}", flush=True)
         return text.strip()
     except Exception as e:
