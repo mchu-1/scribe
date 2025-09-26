@@ -6,6 +6,7 @@ import yaml
 import httpx
 import hashlib
 import tempfile
+import re
 import traceback
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
@@ -151,6 +152,22 @@ def enforce_mms_limit(text: str, limit: int = mms_character_limit) -> str:
     return text[: limit]
 
 
+def split_notes_into_sections(notes_text: str) -> List[str]:
+    """Split the generated notes into sections.
+
+    Sections are separated by one or more blank lines per the authoring
+    instructions in `scribe.md` ("Separate sections with newlines").
+    """
+    if not notes_text:
+        return []
+    # Normalize newlines and split on two-or-more newlines (allowing spaces)
+    normalized = notes_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    raw_sections = re.split(r"\n\s*\n+", normalized)
+    # Clean and drop empties
+    sections: List[str] = [s.strip() for s in raw_sections if s and s.strip()]
+    return sections
+
+
 def save_job(
     job_id: str,
     phone_number: str,
@@ -282,23 +299,30 @@ def process_recording(from_number: str, recording_url: str, call_sid: str) -> No
             transcript=transcript,
             role=role,
         )
-        notes_plaintext = enforce_mms_limit(notes_plaintext, mms_character_limit)
         print(
             f"[scribe] job_id={job_id} notes (len={len(notes_plaintext)}):\n{notes_plaintext}",
             flush=True,
         )
 
+        sections_list = split_notes_into_sections(notes_plaintext)
+
         save_job(
             job_id=job_id,
             phone_number=from_number,
             role=role,
-            sections={},
+            sections={"total": len(sections_list)},
             transcript=transcript,
             notes_plaintext=notes_plaintext,
         )
 
-        if notes_plaintext.strip():
-            send_text_message(to_number=from_number, body=notes_plaintext)
+        if sections_list:
+            for idx, section in enumerate(sections_list, start=1):
+                body = enforce_mms_limit(section, mms_character_limit)
+                print(
+                    f"[scribe] job_id={job_id} sending section {idx}/{len(sections_list)} (len={len(body)})",
+                    flush=True,
+                )
+                send_text_message(to_number=from_number, body=body)
     except Exception as e:
         print(f"[scribe] job_id={job_id} error in process_recording: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
