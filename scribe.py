@@ -316,6 +316,14 @@ def process_recording(from_number: str, recording_url: str, call_sid: str) -> No
         )
 
         if sections_list:
+            # Send header indicating start of a new note
+            header_body = enforce_mms_limit("---NEW NOTE---", mms_character_limit)
+            print(
+                f"[scribe] job_id={job_id} sending header (len={len(header_body)})",
+                flush=True,
+            )
+            send_text_message(to_number=from_number, body=header_body)
+
             for idx, section in enumerate(sections_list, start=1):
                 body = enforce_mms_limit(section, mms_character_limit)
                 print(
